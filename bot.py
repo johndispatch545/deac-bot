@@ -337,6 +337,8 @@ def _pti_keyboard(data):
 
 async def cmd_pti(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
+    if update.effective_chat.id != data.get("maintenance_group_id"):
+        return  # silently ignore - /pti only works in the maintenance group
     if not data["drivers"]:
         await update.message.reply_text("No driver groups registered yet. Use /add in each driver group first.")
         return
@@ -358,6 +360,9 @@ async def cmd_pti(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_pti_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = storage.load()
+    if query.message.chat.id != data.get("maintenance_group_id"):
+        await query.answer("This only works in the maintenance group.")
+        return
     session = data.get("pti_session")
     if not session:
         await query.answer("No active PTI round.")
