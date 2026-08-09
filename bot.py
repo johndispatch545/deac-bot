@@ -223,7 +223,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Reply to the request with /done, or use /done DriverName.")
         return
 
-   data["drivers"][target_gid]["pending"]["resolved"] = True
+    data["drivers"][target_gid]["pending"]["resolved"] = True
     storage.save(data)
     await update.message.reply_text("✅ Marked as done.")
 
