@@ -35,6 +35,8 @@ REMINDER_MINUTES = int(os.environ.get("REMINDER_MINUTES", "5"))
 DAILY_REPORT_HOUR_UTC = int(os.environ.get("DAILY_REPORT_HOUR_UTC", "18"))
 
 AWAITING_TRAILER = set()  # group_ids currently waiting for a trailer number reply
+LAST_MEDIA = {}  # chat_id -> {"kind": "photo|document", "ref": str, "ts": datetime}
+LAST_MEDIA_TTL_MINUTES = 10
 
 
 def driver_label(driver):
@@ -88,6 +90,20 @@ async def post_or_edit_service_message(context, data, group_id, text):
     storage.save(data)
 
 
+async def cache_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remembers the last photo/document sent in a chat, even without a
+    caption, so a separately-sent /BOL can still pick it up."""
+    msg = update.message
+    if msg.photo:
+        LAST_MEDIA[update.effective_chat.id] = {
+            "kind": "photo", "ref": msg.photo[-1].file_id, "ts": datetime.utcnow()
+        }
+    elif msg.document:
+        LAST_MEDIA[update.effective_chat.id] = {
+            "kind": "document", "ref": msg.document.file_id, "ts": datetime.utcnow()
+        }
+
+
 async def cmd_bol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
     driver = storage.ensure_driver(data, update.effective_chat.id)
@@ -100,9 +116,17 @@ async def cmd_bol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ref, kind = msg.document.file_id, "document"
     elif context.args:
         ref, kind = " ".join(context.args), "link"
+    else:
+        # fallback: a photo/PDF sent as its own message just before /BOL
+        cached = LAST_MEDIA.get(update.effective_chat.id)
+        if cached and (datetime.utcnow() - cached["ts"]) <= timedelta(minutes=LAST_MEDIA_TTL_MINUTES):
+            ref, kind = cached["ref"], cached["kind"]
 
     if not ref:
-        await msg.reply_text("Please attach a photo/PDF with caption /BOL, or send /BOL <link>.")
+        await msg.reply_text(
+            "Please attach a photo/PDF with caption /BOL, send /BOL <link>, "
+            "or send the photo first and then /BOL right after."
+        )
         return
 
     driver["active_bol"] = {"kind": kind, "ref": ref, "ts": storage.timestamp()}
@@ -499,6 +523,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_status_button, pattern="^status_"))
     app.add_handler(CallbackQueryHandler(on_pti_button, pattern="^(toggle_|pti_send)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, cache_media))
 
     app.job_queue.run_repeating(reminder_job, interval=60, first=60)
     app.job_queue.run_daily(daily_report_job, time=dtime(hour=DAILY_REPORT_HOUR_UTC))
