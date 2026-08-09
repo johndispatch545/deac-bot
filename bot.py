@@ -59,7 +59,8 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(context.args)
     data = storage.load()
-    storage.ensure_driver(data, update.effective_chat.id, name=name)
+    driver = storage.ensure_driver(data, update.effective_chat.id, name=name)
+    driver["user_id"] = update.effective_user.id
     storage.save(data)
     await update.message.reply_text(f"✅ Registered: {name}")
 
@@ -384,11 +385,20 @@ async def on_pti_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         included = [(gid, d) for gid, d in data["drivers"].items() if int(gid) not in session["excluded_groups"]]
         for gid, driver in included:
             name = driver.get("name") or gid
+            user_id = driver.get("user_id")
             try:
-                await context.bot.send_message(
-                    chat_id=int(gid),
-                    text=f"🔧 {name}, please complete your PTI today and send photos with /ptidone.",
-                )
+                if user_id:
+                    mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+                    await context.bot.send_message(
+                        chat_id=int(gid),
+                        text=f"🔧 {mention}, please complete your PTI today and send photos with /ptidone.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=int(gid),
+                        text=f"🔧 {name}, please complete your PTI today and send photos with /ptidone.",
+                    )
                 session["responses"][gid] = False
             except Exception as e:
                 log.warning("Could not message group %s: %s", gid, e)
