@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: deac-bot-combined
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SERVICE_GROUP_ID
+        sync: false
+      - key: REMINDER_MINUTES
+        value: "5"
+      - key: DAILY_REPORT_HOUR_UTC
+        value: "18"
