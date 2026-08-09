@@ -51,11 +51,11 @@ def progress_bar(done, total, width=12):
 
 
 # ===========================================================================
-# DISPATCH (Stage 1) — /register /BOL /t /POD /PU /DEL /done /pending /export
+# DISPATCH (Stage 1) — /add /BOL /t /POD /PU /DEL /done /pending /export
 # ===========================================================================
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /register First Last")
+        await update.message.reply_text("Usage: /add First Last")
         return
     name = " ".join(context.args)
     data = storage.load()
@@ -78,6 +78,11 @@ async def post_or_edit_service_message(context, data, group_id, text):
             storage.save(data)
             return
         except Exception as e:
+            if "not modified" in str(e).lower():
+                # content is identical to what's already posted - nothing to do
+                pending["last_reminder_ts"] = storage.timestamp()
+                storage.save(data)
+                return
             log.warning("Edit failed, sending new message instead: %s", e)
 
     msg = await context.bot.send_message(chat_id=SERVICE_GROUP_ID, text=text)
@@ -333,7 +338,7 @@ def _pti_keyboard(data):
 async def cmd_pti(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
     if not data["drivers"]:
-        await update.message.reply_text("No driver groups registered yet. Use /register in each driver group first.")
+        await update.message.reply_text("No driver groups registered yet. Use /add in each driver group first.")
         return
 
     data["pti_session"] = {
@@ -502,7 +507,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # dispatch
-    app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("add", cmd_register))
     app.add_handler(CommandHandler(["BOL", "bol"], cmd_bol))
     app.add_handler(CommandHandler("t", cmd_t))
     app.add_handler(CommandHandler(["POD", "pod"], cmd_pod))
