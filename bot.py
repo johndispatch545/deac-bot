@@ -223,9 +223,18 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Reply to the request with /done, or use /done DriverName.")
         return
 
-    data["drivers"][target_gid]["pending"]["resolved"] = True
+   data["drivers"][target_gid]["pending"]["resolved"] = True
     storage.save(data)
     await update.message.reply_text("✅ Marked as done.")
+
+    # let the driver know their request was resolved
+    try:
+        await context.bot.send_message(
+            chat_id=int(target_gid),
+            text="✅ Your request has been resolved by dispatch.",
+        )
+    except Exception as e:
+        log.warning("Could not notify driver group %s: %s", target_gid, e)
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
