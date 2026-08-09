@@ -53,6 +53,7 @@ def ensure_driver(data, group_id, name=None):
         data["drivers"][gid] = {
             "name": name,
             "group_id": group_id,
+            "user_id": None,
             "active_bol": None,
             "last_status": None,
             "pending": None,
