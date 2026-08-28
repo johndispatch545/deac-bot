@@ -18,6 +18,8 @@ _DEFAULT = {
     "maintenance_group_id": None,
     "pti_session": None,
     "history": {},              # driver name -> [ {kind, ref, ts, type}, ... ]
+    "report_interval_days": 1,  # how often the daily report is sent
+    "last_report_date": None,   # ISO date string of the last report sent
 }
 
 # driver record:
@@ -36,9 +38,12 @@ def load():
             return json.loads(json.dumps(_DEFAULT))
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             try:
-                return json.load(f)
+                d = json.load(f)
             except json.JSONDecodeError:
                 return json.loads(json.dumps(_DEFAULT))
+        for k, v in _DEFAULT.items():
+            d.setdefault(k, v)
+        return d
 
 
 def save(data):
