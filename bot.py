@@ -324,6 +324,29 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage.save(data)
     await update.message.reply_text("✅ This group is now the maintenance/service group.")
 
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"{d} kun" if d > 1 else "Har kuni", callback_data=f"interval_{d}")
+          for d in (1, 2, 3, 4)],
+         [InlineKeyboardButton(f"{d} kun", callback_data=f"interval_{d}") for d in (5, 6, 7)]]
+    )
+    await update.message.reply_text(
+        "📊 Kunlik hisobot qancha kunda bir yuborilsin?", reply_markup=keyboard
+    )
+
+
+async def on_interval_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    days = int(query.data.split("_", 1)[1])
+    data = storage.load()
+    if query.message.chat.id != data.get("maintenance_group_id"):
+        await query.answer("This only works in the maintenance group.")
+        return
+    data["report_interval_days"] = days
+    storage.save(data)
+    await query.answer()
+    label = "har kuni" if days == 1 else f"{days} kunda bir marta"
+    await query.edit_message_text(f"✅ Hisobot endi {label} yuboriladi. (/admin bilan qayta o'zgartirish mumkin)")
+
 
 def _pti_keyboard(data):
     excluded = data["pti_session"]["excluded_groups"]
@@ -482,8 +505,21 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not records:
         await update.message.reply_text(f"No history for {name}.")
         return
-    lines = [f"{r['ts'][:16]} — {r['type']} ({r['kind']})" for r in records[-15:]]
-    await update.message.reply_text(f"📁 {name} — last {len(lines)} records:\n" + "\n".join(lines))
+
+    recent = records[-15:]
+    await update.message.reply_text(f"📁 {name} — last {len(recent)} records:")
+    for r in recent:
+        caption = f"{r['ts'][:16]} — {r['type']}"
+        try:
+            if r["kind"] == "photo":
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=r["ref"], caption=caption)
+            elif r["kind"] == "document":
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=r["ref"], caption=caption)
+            else:  # link
+                await update.message.reply_text(f"{caption}\n{r['ref']}")
+        except Exception as e:
+            log.warning("Could not resend history item for %s: %s", name, e)
+            await update.message.reply_text(f"{caption} — (couldn't resend file)")
 
 
 async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,11 +533,79 @@ async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚨 Alert sent. Stay safe.")
 
 
+async def cmd_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sms First Last message text — used in the maintenance group.
+    Sends the message to that driver's group, tagging their profile if
+    known. Works with an attached photo/PDF too (as the caption)."""
+    data = storage.load()
+    if update.effective_chat.id != data.get("maintenance_group_id"):
+        return
+
+    msg = update.message
+    raw = msg.text or msg.caption or ""
+    args_text = raw.partition(" ")[2].strip()
+    parts = args_text.split(" ", 2)
+    if len(parts) < 2:
+        await msg.reply_text("Usage: /sms First Last message text")
+        return
+
+    name = f"{parts[0]} {parts[1]}"
+    text = parts[2] if len(parts) > 2 else ""
+
+    target_gid, target_driver = None, None
+    for gid, driver in data["drivers"].items():
+        if (driver.get("name") or "").lower() == name.lower():
+            target_gid, target_driver = gid, driver
+            break
+
+    if not target_gid:
+        await msg.reply_text(f"Driver not found: {name}")
+        return
+
+    user_id = target_driver.get("user_id")
+    dname = target_driver.get("name")
+    if user_id:
+        prefix = f'<a href="tg://user?id={user_id}">{dname}</a>\n'
+        parse_mode = "HTML"
+    else:
+        prefix = f"{dname}\n"
+        parse_mode = None
+
+    try:
+        if msg.photo:
+            await context.bot.send_photo(
+                chat_id=int(target_gid), photo=msg.photo[-1].file_id,
+                caption=prefix + text, parse_mode=parse_mode,
+            )
+        elif msg.document:
+            await context.bot.send_document(
+                chat_id=int(target_gid), document=msg.document.file_id,
+                caption=prefix + text, parse_mode=parse_mode,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=int(target_gid), text=prefix + text, parse_mode=parse_mode,
+            )
+        await msg.reply_text("✅ Sent.")
+    except Exception as e:
+        log.warning("Could not send /sms to %s: %s", name, e)
+        await msg.reply_text("❌ Could not send message.")
+
+
 async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
     maint_gid = data.get("maintenance_group_id")
     if not maint_gid:
         return
+
+    interval = data.get("report_interval_days", 1)
+    today = datetime.utcnow().date().isoformat()
+    last = data.get("last_report_date")
+    if last:
+        days_since = (datetime.fromisoformat(today) - datetime.fromisoformat(last)).days
+        if days_since < interval:
+            return  # not due yet
+
     total_drivers = len(data["drivers"])
     session = data.get("pti_session")
     pti_line = "No active PTI round."
@@ -513,6 +617,8 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         chat_id=maint_gid,
         text=f"📊 Daily report\nDrivers registered: {total_drivers}\n{pti_line}",
     )
+    data["last_report_date"] = today
+    storage.save(data)
 
 
 # ===========================================================================
@@ -538,10 +644,12 @@ def main():
     app.add_handler(CommandHandler("ptidone", cmd_ptidone))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("incident", cmd_incident))
+    app.add_handler(CommandHandler("sms", cmd_sms))
 
     # shared
     app.add_handler(CallbackQueryHandler(on_status_button, pattern="^status_"))
     app.add_handler(CallbackQueryHandler(on_pti_button, pattern="^(toggle_|pti_send)"))
+    app.add_handler(CallbackQueryHandler(on_interval_button, pattern="^interval_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, cache_media))
 
