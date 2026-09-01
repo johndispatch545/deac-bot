@@ -42,6 +42,7 @@ LAST_MEDIA_TTL_MINUTES = 10
 ENABLED_GROUPS = {}
 COMPANY_NAMES = {}
 DRIVER_DATA = {}
+SAVED_DRIVERS = {}  # Store completed drivers: group_id -> [driver_data_list]
 
 # Status options for driver status field
 STATUS_OPTIONS = ["Pick up", "TERMINATED", "RETURNED", "TRUCK CHANGE", "SHOP", "ACCIDENT"]
@@ -91,6 +92,39 @@ def progress_bar(done, total, width=12):
         return "—"
     filled = round(width * done / total)
     return "▓" * filled + "░" * (width - filled) + f"  {done}/{total}"
+
+
+def build_driver_template(driver_data):
+    """Build the driver information template"""
+    return (
+        f"💁 Driver Name: {driver_data.get('first_name', '')} {driver_data.get('last_name', '')}\n"
+        f"📰 Hired Company Name: {driver_data.get('company_name', '')}\n"
+        f"👨 Driver Type: Company\n"
+        f"Ph-nu# {driver_data.get('phone', '')}\n"
+        f"E-mail: {driver_data.get('email', '')}\n"
+        f"License# {driver_data.get('license_number', '')} ({driver_data.get('license_state', '')})\n"
+        f"🚛 Truck Info:\n"
+        f"Unit/Truck#: {driver_data.get('truck_number', '')}\n"
+        f"Year: {driver_data.get('truck_year', '')}\n"
+        f"Make: {driver_data.get('truck_make', '')}\n"
+        f"Made/Model: {driver_data.get('truck_model', '')}\n"
+        f"VIN: {driver_data.get('vin', '')}\n"
+        f"Plate: {driver_data.get('plate_state', '')} / {driver_data.get('plate_number', '')}\n"
+        f"📍 Status: {driver_data.get('status', '')}"
+    )
+
+
+def check_driver_exists(group_id, first_name, last_name):
+    """Check if driver with same name already exists"""
+    if group_id not in SAVED_DRIVERS:
+        return None
+    
+    search_name = f"{first_name} {last_name}".lower()
+    for driver in SAVED_DRIVERS[group_id]:
+        existing_name = f"{driver.get('first_name', '')} {driver.get('last_name', '')}".lower()
+        if existing_name == search_name:
+            return driver
+    return None
 
 
 # ===========================================================================
@@ -690,6 +724,9 @@ async def updadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if group_id not in DRIVER_DATA:
         DRIVER_DATA[group_id] = {}
 
+    if group_id not in SAVED_DRIVERS:
+        SAVED_DRIVERS[group_id] = []
+
     await update.message.reply_text(
         f"✅ Driver Management enabled for {group_name}!\n\n"
         "Now use /newdriver to add a new driver."
@@ -868,6 +905,13 @@ async def handle_driver_text_input(update: Update, context: ContextTypes.DEFAULT
         except:
             pass
 
+        # Show current collected information
+        driver_data = DRIVER_DATA[group_id][user_id]
+        current_template = build_driver_template(driver_data)
+        await update.message.reply_text(
+            f"✅ Received!\n\n📋 Current collected information:\n\n{current_template}"
+        )
+
         # Ask for next field
         await ask_for_missing_field(update, context, group_id, user_id)
 
@@ -886,6 +930,13 @@ async def handle_driver_status_selection(update: Update, context: ContextTypes.D
 
     await query.delete_message()
 
+    # Show current collected information
+    driver_data = DRIVER_DATA[group_id][user_id]
+    current_template = build_driver_template(driver_data)
+    await query.message.reply_text(
+        f"✅ Status saved!\n\n📋 Current collected information:\n\n{current_template}"
+    )
+
     # Ask for next field or show final template
     await ask_for_missing_field(update, context, group_id, user_id)
 
@@ -898,34 +949,117 @@ async def show_final_template(
 ) -> None:
     """Show the completed driver information template"""
     driver_data = DRIVER_DATA[group_id][user_id]
+    first_name = driver_data.get('first_name', '')
+    last_name = driver_data.get('last_name', '')
 
-    # Build the final template with exact formatting
-    template = (
-        f"💁 Driver Name: {driver_data.get('first_name', '')} {driver_data.get('last_name', '')}\n"
-        f"📰 Hired Company Name: {driver_data.get('company_name', '')}\n"
-        f"👨 Driver Type: Company\n"
-        f"Ph-nu# {driver_data.get('phone', '')}\n"
-        f"E-mail: {driver_data.get('email', '')}\n"
-        f"License# {driver_data.get('license_number', '')} ({driver_data.get('license_state', '')})\n"
-        f"🚛 Truck Info:\n"
-        f"Unit/Truck#: {driver_data.get('truck_number', '')}\n"
-        f"Year: {driver_data.get('truck_year', '')}\n"
-        f"Make: {driver_data.get('truck_make', '')}\n"
-        f"Made/Model: {driver_data.get('truck_model', '')}\n"
-        f"VIN: {driver_data.get('vin', '')}\n"
-        f"Plate: {driver_data.get('plate_state', '')} / {driver_data.get('plate_number', '')}\n"
-        f"📍 Status: {driver_data.get('status', '')}"
+    # Check if driver already exists
+    existing_driver = check_driver_exists(group_id, first_name, last_name)
+    
+    if existing_driver:
+        # Driver exists - ask to update
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✏️ Update Driver Info", callback_data=f"update_driver:{first_name}_{last_name}"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_driver"),
+            ]
+        ])
+        
+        existing_template = build_driver_template(existing_driver)
+        new_template = build_driver_template(driver_data)
+        
+        message_text = (
+            f"⚠️ DRIVER ALREADY EXISTS!\n\n"
+            f"🔴 Existing Driver:\n{existing_template}\n\n"
+            f"🟢 New Driver Info:\n{new_template}\n\n"
+            f"Would you like to update the driver information?"
+        )
+        
+        await update.message.reply_text(message_text, reply_markup=keyboard)
+        return
+    
+    # New driver - show final template
+    template = build_driver_template(driver_data)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm & Save", callback_data="confirm_driver")]
+    ])
+    
+    await update.message.reply_text(
+        f"📋 Complete Driver Information:\n\n{template}",
+        reply_markup=keyboard
     )
 
-    await update.message.reply_text(template)
 
-    # Clear data for this user after completion
-    DRIVER_DATA[group_id].pop(user_id, None)
-    
-    # Clean up context data
-    for key in list(context.user_data.keys()):
-        if f"{group_id}_{user_id}" in key:
-            context.user_data.pop(key, None)
+async def on_update_driver_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle update driver decision"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel_driver":
+        group_id = query.message.chat.id
+        user_id = query.from_user.id
+        
+        # Clear data
+        if user_id in DRIVER_DATA[group_id]:
+            DRIVER_DATA[group_id].pop(user_id, None)
+        
+        for key in list(context.user_data.keys()):
+            if f"{group_id}_{user_id}" in key:
+                context.user_data.pop(key, None)
+        
+        await query.edit_message_text("❌ Cancelled. Driver information not saved.")
+        return
+
+    if query.data == "confirm_driver":
+        group_id = query.message.chat.id
+        user_id = query.from_user.id
+        driver_data = DRIVER_DATA[group_id][user_id]
+        
+        # Save the driver
+        if group_id not in SAVED_DRIVERS:
+            SAVED_DRIVERS[group_id] = []
+        SAVED_DRIVERS[group_id].append(driver_data)
+        
+        # Clear data
+        DRIVER_DATA[group_id].pop(user_id, None)
+        for key in list(context.user_data.keys()):
+            if f"{group_id}_{user_id}" in key:
+                context.user_data.pop(key, None)
+        
+        template = build_driver_template(driver_data)
+        await query.edit_message_text(
+            f"✅ Driver Saved Successfully!\n\n{template}"
+        )
+        return
+
+    if query.data.startswith("update_driver:"):
+        group_id = query.message.chat.id
+        user_id = query.from_user.id
+        driver_data = DRIVER_DATA[group_id][user_id]
+        
+        # Update existing driver
+        first_name = driver_data.get('first_name', '')
+        last_name = driver_data.get('last_name', '')
+        
+        if group_id not in SAVED_DRIVERS:
+            SAVED_DRIVERS[group_id] = []
+        
+        # Find and update the driver
+        for i, driver in enumerate(SAVED_DRIVERS[group_id]):
+            if (driver.get('first_name', '') == first_name and 
+                driver.get('last_name', '') == last_name):
+                SAVED_DRIVERS[group_id][i] = driver_data
+                break
+        
+        # Clear data
+        DRIVER_DATA[group_id].pop(user_id, None)
+        for key in list(context.user_data.keys()):
+            if f"{group_id}_{user_id}" in key:
+                context.user_data.pop(key, None)
+        
+        template = build_driver_template(driver_data)
+        await query.edit_message_text(
+            f"✅ Driver Updated Successfully!\n\n{template}"
+        )
 
 
 # ===========================================================================
@@ -963,6 +1097,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_interval_button, pattern="^interval_"))
     app.add_handler(CallbackQueryHandler(handle_company_selection, pattern="^company:"))
     app.add_handler(CallbackQueryHandler(handle_driver_status_selection, pattern="^status:"))
+    app.add_handler(CallbackQueryHandler(on_update_driver_decision, pattern="^(update_driver:|confirm_driver|cancel_driver)"))
 
     # message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_text_input))
