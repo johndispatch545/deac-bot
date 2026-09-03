@@ -1,9 +1,7 @@
 """
-Render's free tier only keeps a *Web Service* alive (not a background
-worker), which means it expects something listening on $PORT. This
-spins up a tiny HTTP server in a background thread that just replies
-"OK" - it does nothing else. Ping this URL every few minutes with
-UptimeRobot (free) so Render doesn't put the service to sleep.
+Tiny keep-alive HTTP server. On platforms that require a bound port
+(e.g. Render's free Web Service tier) this satisfies that requirement.
+Harmless no-op on platforms like Railway that don't need it.
 """
 import os
 import threading
