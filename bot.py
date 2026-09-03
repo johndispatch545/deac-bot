@@ -674,37 +674,84 @@ REQUIRED_FIELDS = [
 ]
 STATUS_OPTIONS = ["Pick up", "TERMINATED", "RETURNED", "TRUCK CHANGE", "SHOP", "ACCIDENT"]
 
+# ordered longest-pattern-first so e.g. "Hired Company name" isn't cut short
+# by a looser pattern matching first
 FIELD_PATTERNS = {
-    "name": r"driver\s*name",
     "company": r"(?:hired\s*)?company(?:\s*name)?",
     "driver_type": r"driver\s*type",
-    "phone": r"ph[\-\s]*(?:nu)?#?|phone",
+    "name": r"driver\s*name",
+    "phone": r"ph[\-\s]*(?:nu)?#?|phone\s*#?|tel(?:ephone)?\s*#?",
     "email": r"e[\-\s]*mail",
-    "license": r"license\s*#?",
+    "license": r"license\s*#?|lic\s*#?|dl\s*#?",
     "unit": r"unit\s*#?|truck\s*#?|unit\s*number|truck\s*number",
     "year": r"year",
     "make": r"make",
     "made": r"made|model",
-    "vin": r"vin",
-    "plate": r"plate",
+    "vin": r"vin\s*#?",
+    "plate": r"plate\s*#?|tag\s*#?",
     "status": r"status",
 }
+# longest regex source first, so "hired company name" matches before "company"
+_LABEL_ALT = "|".join(
+    f"(?:{p})" for p in sorted(FIELD_PATTERNS.values(), key=len, reverse=True)
+)
+_LABEL_RE = re.compile(_LABEL_ALT, re.IGNORECASE)
+
+
+def _split_line_multi(line):
+    """Splits one line into (label_text, value) pairs, handling lines that
+    contain more than one 'Label: value' pair (e.g. 'Year: 2023 Make: FRHT').
+    A candidate label is only accepted if it's immediately followed by ':' or
+    '#', or already has a '#' embedded in its own match (e.g. 'License#') —
+    otherwise a value that happens to *contain* a label word (e.g. Driver
+    Type: Company) would wrongly be read as a new field."""
+    raw_matches = list(
+        re.finditer(rf"(?P<label>{_LABEL_ALT})(?P<punct>\s*[:#])?", line, re.IGNORECASE)
+    )
+    matches = [m for m in raw_matches if m.group("punct") or "#" in m.group("label")]
+    if not matches:
+        return []
+    segments = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+        value = line[start:end].strip(" \t:#-")
+        segments.append((m.group("label"), value))
+    return segments
 
 
 def parse_driver_fields(text):
-    """Pulls out any recognizable 'Label: value' lines from free-form text."""
+    """Pulls recognizable fields out of free-form text:
+    - labeled lines, including several labels on one line
+    - unlabeled values it can still recognize by shape (email, VIN, phone)
+    """
     found = {}
-    for line in text.splitlines():
-        line = line.strip().lstrip("💁📰👨🚛📍").strip()
-        if ":" not in line and "#" not in line:
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("💁📰👨🚛📍").strip()
+        if not line:
             continue
-        for key, pattern in FIELD_PATTERNS.items():
-            m = re.match(rf"^{pattern}\s*[:#]?\s*(.+)$", line, re.IGNORECASE)
-            if m:
-                val = m.group(1).strip()
-                if val:
+        for label_text, val in _split_line_multi(line):
+            if not val:
+                continue
+            for key, pat in FIELD_PATTERNS.items():
+                if re.fullmatch(pat, label_text.strip(), re.IGNORECASE):
                     found[key] = val
-                break
+                    break
+
+    # context-based fallback for values sent without any label at all
+    if "email" not in found:
+        m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+        if m:
+            found["email"] = m.group(0)
+    if "vin" not in found:
+        m = re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text.upper())
+        if m:
+            found["vin"] = m.group(0)
+    if "phone" not in found:
+        m = re.search(r"(\+?\d[\d\-\s\(\)]{8,}\d)", text)
+        if m:
+            found["phone"] = m.group(0).strip()
+
     return found
 
 
@@ -739,14 +786,72 @@ def _company_keyboard(data):
     return InlineKeyboardMarkup(rows)
 
 
+def _confirm_keyboard():
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Confirm & Post", callback_data="updconfirm"),
+            InlineKeyboardButton("✏️ Edit a field", callback_data="updedit_hint"),
+        ]]
+    )
+
+
+def _find_duplicates(data, draft, exclude_name=None):
+    """Returns a list of warning strings if this VIN/license/plate is
+    already used by a different driver profile."""
+    warnings = []
+    for key, label in (("vin", "VIN"), ("license", "License#"), ("plate", "Plate")):
+        val = (draft.get(key) or "").strip().lower()
+        if not val:
+            continue
+        for pname, profile in data.get("driver_profiles", {}).items():
+            if exclude_name and pname == exclude_name:
+                continue
+            if (profile.get(key) or "").strip().lower() == val:
+                warnings.append(f"⚠️ {label} '{draft.get(key)}' is already used by {profile.get('name', pname)}.")
+    return warnings
+
+
 async def cmd_updadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
     data["update_group_id"] = update.effective_chat.id
     data.setdefault("companies", [])
+    data.setdefault("driver_profiles", {})
     data["update_draft"] = {}
     data["update_missing_msg_id"] = None
     storage.save(data)
     await update.message.reply_text("✅ This group is now the driver-update group.")
+
+
+async def _present_next_step(update_or_query, context, data, chat_id):
+    """Shared logic: given the current draft, either ask for company,
+    ask for missing fields, or show the confirm-and-post preview."""
+    draft = data.get("update_draft", {})
+
+    async def send(text, **kwargs):
+        if hasattr(update_or_query, "message") and update_or_query.message is None:
+            return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        return await update_or_query.message.reply_text(text, **kwargs)
+
+    if not draft.get("company"):
+        msg = await send("🏢 Select the company, or add a new one:", reply_markup=_company_keyboard(data))
+        data["update_missing_msg_id"] = msg.message_id
+        storage.save(data)
+        return
+
+    missing = missing_fields(draft)
+    if missing:
+        msg = await send("Still need:\n" + "\n".join(f"• {m}" for m in missing))
+        data["update_missing_msg_id"] = msg.message_id
+        storage.save(data)
+        return
+
+    warnings = _find_duplicates(data, draft)
+    preview = build_template(draft)
+    if warnings:
+        preview = "\n".join(warnings) + "\n\n" + preview
+    msg = await send(preview, reply_markup=_confirm_keyboard())
+    data["update_missing_msg_id"] = msg.message_id
+    storage.save(data)
 
 
 async def _handle_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE, data, text):
@@ -756,7 +861,6 @@ async def _handle_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     data["update_draft"] = draft
     storage.save(data)
 
-    # clear the previous "still need..." prompt, if any — we just got new info
     old_msg_id = data.get("update_missing_msg_id")
     if old_msg_id:
         try:
@@ -764,31 +868,9 @@ async def _handle_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
         data["update_missing_msg_id"] = None
-
-    # company gets offered as buttons instead of typed, if we don't have it yet
-    if not draft.get("company"):
         storage.save(data)
-        msg = await update.message.reply_text(
-            "🏢 Select the company, or add a new one:", reply_markup=_company_keyboard(data)
-        )
-        data["update_missing_msg_id"] = msg.message_id
-        storage.save(data)
-        return
 
-    missing = missing_fields(draft)
-    if missing:
-        msg = await update.message.reply_text(
-            "Still need:\n" + "\n".join(f"• {m}" for m in missing)
-        )
-        data["update_missing_msg_id"] = msg.message_id
-        storage.save(data)
-        return
-
-    # complete! post the full template and reset for the next driver
-    await update.message.reply_text(build_template(draft))
-    data["update_draft"] = {}
-    data["update_missing_msg_id"] = None
-    storage.save(data)
+    await _present_next_step(update, context, data, update.effective_chat.id)
 
 
 async def on_company_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,20 +892,99 @@ async def on_company_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["update_missing_msg_id"] = None
         storage.save(data)
         await query.edit_message_text(f"🏢 Company set: {companies[idx]}")
-
-        missing = missing_fields(draft)
-        if missing:
-            msg = await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text="Still need:\n" + "\n".join(f"• {m}" for m in missing),
-            )
-            data["update_missing_msg_id"] = msg.message_id
-            storage.save(data)
-        else:
-            await context.bot.send_message(chat_id=query.message.chat.id, text=build_template(draft))
-            data["update_draft"] = {}
-            storage.save(data)
+        await _present_next_step(query, context, data, query.message.chat.id)
     await query.answer()
+
+
+async def on_update_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = storage.load()
+    draft = data.get("update_draft", {})
+
+    if query.data == "updedit_hint":
+        await query.answer("Just resend the field you want to fix, e.g. 'Phone: 555-1234'.", show_alert=True)
+        return
+
+    if query.data == "updconfirm":
+        if not draft.get("name"):
+            await query.answer("Missing driver name.")
+            return
+        key = draft["name"].strip().lower()
+        profile = dict(draft)
+        profile["ts"] = storage.timestamp()
+        data.setdefault("driver_profiles", {})[key] = profile
+        data["update_draft"] = {}
+        data["update_missing_msg_id"] = None
+        storage.save(data)
+        await query.edit_message_text(build_template(profile) + "\n\n✅ Saved.")
+        await query.answer()
+
+
+async def cmd_finddriver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = storage.load()
+    if update.effective_chat.id != data.get("update_group_id"):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /finddriver <name, plate, VIN, or license>")
+        return
+    query = " ".join(context.args).strip().lower()
+    matches = []
+    for pname, profile in data.get("driver_profiles", {}).items():
+        haystack = " ".join(str(profile.get(k, "")) for k in ("name", "plate", "vin", "license")).lower()
+        if query in haystack:
+            matches.append(profile)
+    if not matches:
+        await update.message.reply_text("No matching driver found.")
+        return
+    for profile in matches[:5]:
+        await update.message.reply_text(build_template(profile))
+
+
+async def cmd_updedit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = storage.load()
+    if update.effective_chat.id != data.get("update_group_id"):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /updedit Driver Name")
+        return
+    name = " ".join(context.args).strip()
+    key = name.lower()
+    profile = data.get("driver_profiles", {}).get(key)
+    if not profile:
+        await update.message.reply_text(f"No saved profile for {name}.")
+        return
+    data["update_draft"] = dict(profile)
+    data["update_missing_msg_id"] = None
+    storage.save(data)
+    await update.message.reply_text(
+        f"✏️ Editing {name}. Send the field(s) you want to change (e.g. 'Phone: 555-1234'), "
+        "then confirm when done."
+    )
+    await _present_next_step(update, context, data, update.effective_chat.id)
+
+
+async def cmd_exportdrivers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = storage.load()
+    if update.effective_chat.id != data.get("update_group_id"):
+        return
+    profiles = data.get("driver_profiles", {})
+    if not profiles:
+        await update.message.reply_text("No saved driver profiles yet.")
+        return
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    fieldnames = [key for key, _ in REQUIRED_FIELDS] + ["status"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for profile in profiles.values():
+        writer.writerow({k: profile.get(k, "") for k in fieldnames})
+
+    bio = io.BytesIO(buf.getvalue().encode("utf-8"))
+    bio.name = "drivers.csv"
+    await context.bot.send_document(chat_id=update.effective_chat.id, document=bio, filename="drivers.csv")
 
 
 # ===========================================================================
@@ -846,6 +1007,9 @@ def main():
     # maintenance / PTI
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("updadmin", cmd_updadmin))
+    app.add_handler(CommandHandler("finddriver", cmd_finddriver))
+    app.add_handler(CommandHandler("updedit", cmd_updedit))
+    app.add_handler(CommandHandler("exportdrivers", cmd_exportdrivers))
     app.add_handler(CommandHandler("pti", cmd_pti))
     app.add_handler(CommandHandler("ptidone", cmd_ptidone))
     app.add_handler(CommandHandler("history", cmd_history))
@@ -857,6 +1021,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_pti_button, pattern="^(toggle_|pti_send)"))
     app.add_handler(CallbackQueryHandler(on_interval_button, pattern="^interval_"))
     app.add_handler(CallbackQueryHandler(on_company_button, pattern="^company_"))
+    app.add_handler(CallbackQueryHandler(on_update_confirm_button, pattern="^(updconfirm|updedit_hint)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, cache_media))
 
