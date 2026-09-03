@@ -397,6 +397,11 @@ async def cmd_pti(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = storage.load()
     if update.effective_chat.id != data.get("maintenance_group_id"):
         return  # silently ignore - /pti only works in the maintenance group
+
+    if context.args:
+        await _pti_lookup(update, context, data)
+        return
+
     if not data["drivers"]:
         await update.message.reply_text("No driver groups registered yet. Use /add in each driver group first.")
         return
@@ -413,6 +418,40 @@ async def cmd_pti(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Weekly PTI — tap a driver to exclude them, then press Send.",
         reply_markup=_pti_keyboard(data),
     )
+
+
+async def _pti_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, data):
+    """/pti DriverName [YYYY-MM-DD] — resend that driver's past PTI photos."""
+    args = list(context.args)
+    date_filter = None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", args[-1]):
+        date_filter = args.pop()
+    name = " ".join(args).strip()
+    if not name:
+        await update.message.reply_text("Usage: /pti DriverName [YYYY-MM-DD]")
+        return
+
+    records = [r for r in data.get("history", {}).get(name, []) if r.get("type") == "PTI"]
+    if date_filter:
+        records = [r for r in records if r["ts"][:10] == date_filter]
+    if not records:
+        suffix = f" on {date_filter}" if date_filter else ""
+        await update.message.reply_text(f"No PTI records found for {name}{suffix}.")
+        return
+
+    to_send = records if date_filter else [records[-1]]
+    for r in to_send:
+        caption = f"{r['ts'][:16]} — PTI — {name}"
+        try:
+            if r["kind"] == "photo":
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=r["ref"], caption=caption)
+            elif r["kind"] == "document":
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=r["ref"], caption=caption)
+            else:
+                await update.message.reply_text(f"{caption}\n{r['ref']}")
+        except Exception as e:
+            log.warning("Could not resend PTI record for %s: %s", name, e)
+            await update.message.reply_text(f"{caption} — (couldn't resend)")
 
 
 async def on_pti_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,14 +506,23 @@ async def on_pti_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
 
+def _build_pti_summary_text(data):
+    session = data["pti_session"]
+    total = len(session["responses"])
+    done = sum(1 for v in session["responses"].values() if v)
+    lines = [f"PTI progress: {done}/{total}"]
+    for gid, is_done in session["responses"].items():
+        dname = data["drivers"].get(gid, {}).get("name", gid)
+        lines.append(f"{'✅' if is_done else '❌'} {dname}")
+    return "\n".join(lines)
+
+
 async def _post_or_update_summary(context, data):
     session = data.get("pti_session")
     maint_gid = data.get("maintenance_group_id")
     if not session or not maint_gid:
         return
-    total = len(session["responses"])
-    done = sum(1 for v in session["responses"].values() if v)
-    text = f"PTI progress: {progress_bar(done, total)}"
+    text = _build_pti_summary_text(data)
 
     if session.get("summary_msg_id"):
         try:
@@ -515,6 +563,21 @@ async def cmd_ptidone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage.save(data)
 
     await update.message.reply_text("🙏 Thank you, safe trip.")
+
+    # forward the actual photo/document/link to the maintenance group right away
+    maint_gid = data.get("maintenance_group_id")
+    if maint_gid and ref:
+        caption = f"📸 PTI — {name} — {storage.timestamp()[:16]}"
+        try:
+            if kind == "photo":
+                await context.bot.send_photo(chat_id=maint_gid, photo=ref, caption=caption)
+            elif kind == "document":
+                await context.bot.send_document(chat_id=maint_gid, document=ref, caption=caption)
+            else:
+                await context.bot.send_message(chat_id=maint_gid, text=f"{caption}\n{ref}")
+        except Exception as e:
+            log.warning("Could not forward PTI media to maintenance group: %s", e)
+
     await _post_or_update_summary(context, data)
 
     if all(session["responses"].values()):
@@ -525,6 +588,33 @@ async def cmd_ptidone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         maint_gid = data.get("maintenance_group_id")
         if maint_gid:
             await context.bot.send_message(chat_id=maint_gid, text="✅ PTI complete:\n" + "\n".join(lines))
+
+
+async def cmd_ptiexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = storage.load()
+    if update.effective_chat.id != data.get("maintenance_group_id"):
+        return
+
+    rows = []
+    for name, records in data.get("history", {}).items():
+        for r in records:
+            if r.get("type") == "PTI":
+                rows.append((r["ts"][:10], name, r["ts"][11:16], r["kind"]))
+    if not rows:
+        await update.message.reply_text("No PTI history yet.")
+        return
+    rows.sort(key=lambda row: row[0], reverse=True)
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Driver", "Time (UTC)", "Type"])
+    writer.writerows(rows)
+    bio = io.BytesIO(buf.getvalue().encode("utf-8"))
+    bio.name = "pti_history.csv"
+    await context.bot.send_document(chat_id=update.effective_chat.id, document=bio, filename="pti_history.csv")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1013,6 +1103,7 @@ def main():
     app.add_handler(CommandHandler("pti", cmd_pti))
     app.add_handler(CommandHandler("ptidone", cmd_ptidone))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("ptiexcel", cmd_ptiexcel))
     app.add_handler(CommandHandler("incident", cmd_incident))
     app.add_handler(CommandHandler("sms", cmd_sms))
 
