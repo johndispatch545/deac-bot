@@ -1,6 +1,6 @@
 """
 DEAC Bot — Stage 3 (Stage 1 dispatch + Stage 2 PTI/maintenance, merged
-into a single bot/process/deployment) + Stage 4 (Driver Information Management).
+into a single bot/process/deployment).
 
 Environment variables required:
   BOT_TOKEN          - Telegram bot token (one bot now, not two)
@@ -9,6 +9,7 @@ Environment variables required:
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, time as dtime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -35,52 +36,9 @@ REMINDER_MINUTES = int(os.environ.get("REMINDER_MINUTES", "5"))
 DAILY_REPORT_HOUR_UTC = int(os.environ.get("DAILY_REPORT_HOUR_UTC", "18"))
 
 AWAITING_TRAILER = set()  # group_ids currently waiting for a trailer number reply
+AWAITING_COMPANY = set()  # group_ids currently waiting for a typed new company name
 LAST_MEDIA = {}  # chat_id -> {"kind": "photo|document", "ref": str, "ts": datetime}
 LAST_MEDIA_TTL_MINUTES = 10
-
-# Stage 4: Driver Information Management
-ENABLED_GROUPS = {}
-COMPANY_NAMES = {}
-DRIVER_DATA = {}
-SAVED_DRIVERS = {}  # Store completed drivers: group_id -> [driver_data_list]
-
-# Status options for driver status field
-STATUS_OPTIONS = ["Pick up", "TERMINATED", "RETURNED", "TRUCK CHANGE", "SHOP", "ACCIDENT"]
-
-# Field definitions and order for driver information
-FIELDS_ORDER = [
-    "first_name",
-    "last_name",
-    "phone",
-    "email",
-    "license_number",
-    "license_state",
-    "truck_number",
-    "truck_year",
-    "truck_make",
-    "truck_model",
-    "vin",
-    "plate_number",
-    "plate_state",
-    "status",
-]
-
-FIELD_PROMPTS = {
-    "first_name": "Please enter the driver's first name:",
-    "last_name": "Please enter the driver's last name:",
-    "phone": "Please enter the driver's phone number:",
-    "email": "Please enter the driver's email:",
-    "license_number": "Please enter the driver's license number:",
-    "license_state": "Please enter the license state (e.g., TX, OH):",
-    "truck_number": "Please enter the truck/unit number:",
-    "truck_year": "Please enter the truck year:",
-    "truck_make": "Please enter the truck make (e.g., FRHT):",
-    "truck_model": "Please enter the truck model/made (e.g., Cascadia):",
-    "vin": "Please enter the VIN:",
-    "plate_number": "Please enter the plate number:",
-    "plate_state": "Please enter the plate state:",
-    "status": "Please select the driver status:",
-}
 
 
 def driver_label(driver):
@@ -92,39 +50,6 @@ def progress_bar(done, total, width=12):
         return "—"
     filled = round(width * done / total)
     return "▓" * filled + "░" * (width - filled) + f"  {done}/{total}"
-
-
-def build_driver_template(driver_data):
-    """Build the driver information template"""
-    return (
-        f"💁 Driver Name: {driver_data.get('first_name', '')} {driver_data.get('last_name', '')}\n"
-        f"📰 Hired Company Name: {driver_data.get('company_name', '')}\n"
-        f"👨 Driver Type: Company\n"
-        f"Ph-nu# {driver_data.get('phone', '')}\n"
-        f"E-mail: {driver_data.get('email', '')}\n"
-        f"License# {driver_data.get('license_number', '')} ({driver_data.get('license_state', '')})\n"
-        f"🚛 Truck Info:\n"
-        f"Unit/Truck#: {driver_data.get('truck_number', '')}\n"
-        f"Year: {driver_data.get('truck_year', '')}\n"
-        f"Make: {driver_data.get('truck_make', '')}\n"
-        f"Made/Model: {driver_data.get('truck_model', '')}\n"
-        f"VIN: {driver_data.get('vin', '')}\n"
-        f"Plate: {driver_data.get('plate_state', '')} / {driver_data.get('plate_number', '')}\n"
-        f"📍 Status: {driver_data.get('status', '')}"
-    )
-
-
-def check_driver_exists(group_id, first_name, last_name):
-    """Check if driver with same name already exists"""
-    if group_id not in SAVED_DRIVERS:
-        return None
-    
-    search_name = f"{first_name} {last_name}".lower()
-    for driver in SAVED_DRIVERS[group_id]:
-        existing_name = f"{driver.get('first_name', '')} {driver.get('last_name', '')}".lower()
-        if existing_name == search_name:
-            return driver
-    return None
 
 
 # ===========================================================================
@@ -282,6 +207,7 @@ async def on_status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+
     if chat_id in AWAITING_TRAILER:
         trailer = update.message.text.strip()
         data = storage.load()
@@ -290,6 +216,37 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.save(data)
         AWAITING_TRAILER.discard(chat_id)
         await update.message.reply_text(f"✅ Status saved: EMPTY #{trailer}")
+        return
+
+    if chat_id in AWAITING_COMPANY:
+        name = update.message.text.strip()
+        data = storage.load()
+        companies = data.setdefault("companies", [])
+        if name not in companies:
+            companies.append(name)
+        draft = data.get("update_draft", {})
+        draft["company"] = name
+        data["update_draft"] = draft
+        storage.save(data)
+        AWAITING_COMPANY.discard(chat_id)
+        await update.message.reply_text(f"🏢 Company added and set: {name}")
+
+        missing = missing_fields(draft)
+        if missing:
+            msg = await update.message.reply_text(
+                "Still need:\n" + "\n".join(f"• {m}" for m in missing)
+            )
+            data["update_missing_msg_id"] = msg.message_id
+            storage.save(data)
+        else:
+            await update.message.reply_text(build_template(draft))
+            data["update_draft"] = {}
+            storage.save(data)
+        return
+
+    data = storage.load()
+    if chat_id == data.get("update_group_id"):
+        await _handle_update_text(update, context, data, update.message.text)
 
 
 async def cmd_pu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -699,367 +656,174 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===========================================================================
-# DRIVER INFORMATION MANAGEMENT (Stage 4) — /updadmin /newdriver
+# NEW-DRIVER UPDATE PARSER (/updadmin) — free-text driver info -> template
 # ===========================================================================
+REQUIRED_FIELDS = [
+    ("name", "Driver Name"),
+    ("company", "Hired Company name"),
+    ("driver_type", "Driver Type"),
+    ("phone", "Phone number"),
+    ("email", "E-mail"),
+    ("license", "License# (with state)"),
+    ("unit", "Truck/Unit number"),
+    ("year", "Truck Year"),
+    ("make", "Truck Make"),
+    ("made", "Truck Model (Made)"),
+    ("vin", "VIN"),
+    ("plate", "Plate (with state)"),
+]
+STATUS_OPTIONS = ["Pick up", "TERMINATED", "RETURNED", "TRUCK CHANGE", "SHOP", "ACCIDENT"]
 
-async def updadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /updadmin command - enable driver feature for the group"""
-    if update.message.chat.type == "private":
-        await update.message.reply_text("❌ This command can only be used in groups!")
-        return
-
-    group_id = update.message.chat.id
-    group_name = update.message.chat.title
-
-    # Enable the feature for this group
-    ENABLED_GROUPS[group_id] = {
-        "name": group_name,
-        "enabled": True,
-    }
-
-    # Initialize storage for this group
-    if group_id not in COMPANY_NAMES:
-        COMPANY_NAMES[group_id] = []
-
-    if group_id not in DRIVER_DATA:
-        DRIVER_DATA[group_id] = {}
-
-    if group_id not in SAVED_DRIVERS:
-        SAVED_DRIVERS[group_id] = []
-
-    await update.message.reply_text(
-        f"✅ Driver Management enabled for {group_name}!\n\n"
-        "Now use /newdriver to add a new driver."
-    )
-
-
-async def newdriver_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /newdriver command - start driver information collection"""
-    if update.message.chat.type == "private":
-        await update.message.reply_text("❌ This command can only be used in groups!")
-        return
-
-    group_id = update.message.chat.id
-    user_id = update.message.from_user.id
-
-    # Check if feature is enabled for this group
-    if group_id not in ENABLED_GROUPS or not ENABLED_GROUPS[group_id]["enabled"]:
-        await update.message.reply_text(
-            "❌ Driver management is not enabled for this group.\n"
-            "Ask an admin to use /updadmin first."
-        )
-        return
-
-    # Initialize driver data for this user
-    if user_id not in DRIVER_DATA[group_id]:
-        DRIVER_DATA[group_id][user_id] = {}
-
-    # Start with company name selection
-    await ask_company_name(update, context, group_id, user_id)
+FIELD_PATTERNS = {
+    "name": r"driver\s*name",
+    "company": r"(?:hired\s*)?company(?:\s*name)?",
+    "driver_type": r"driver\s*type",
+    "phone": r"ph[\-\s]*(?:nu)?#?|phone",
+    "email": r"e[\-\s]*mail",
+    "license": r"license\s*#?",
+    "unit": r"unit\s*#?|truck\s*#?|unit\s*number|truck\s*number",
+    "year": r"year",
+    "make": r"make",
+    "made": r"made|model",
+    "vin": r"vin",
+    "plate": r"plate",
+    "status": r"status",
+}
 
 
-async def ask_company_name(
-    update: Update, 
-    context: ContextTypes.DEFAULT_TYPE, 
-    group_id: int, 
-    user_id: int
-) -> None:
-    """Ask for company name with options"""
-    saved_companies = COMPANY_NAMES.get(group_id, [])
-
-    keyboard = []
-
-    # Add saved companies as buttons
-    for company in saved_companies:
-        keyboard.append([InlineKeyboardButton(company, callback_data=f"company:{company}")])
-
-    # Add "Add New Company Name" button
-    keyboard.append([InlineKeyboardButton("➕ Add New Company Name", callback_data="company:new")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = await update.message.reply_text(
-        "Please select a Hired Company Name or add a new one:",
-        reply_markup=reply_markup,
-    )
-
-    context.user_data[f"last_message_{group_id}_{user_id}"] = message.message_id
-
-
-async def handle_company_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle company name selection"""
-    query = update.callback_query
-    await query.answer()
-
-    group_id = query.message.chat.id
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "company:new":
-        # Ask for new company name
-        msg = await query.edit_message_text("Please enter the new company name:")
-        context.user_data[f"awaiting_new_company_{group_id}_{user_id}"] = True
-        context.user_data[f"last_message_{group_id}_{user_id}"] = msg.message_id
-    else:
-        # Use selected company
-        company_name = data.replace("company:", "")
-        DRIVER_DATA[group_id][user_id]["company_name"] = company_name
-        await query.delete_message()
-        await ask_for_missing_field(update, context, group_id, user_id)
-
-
-async def ask_for_missing_field(
-    update: Update, 
-    context: ContextTypes.DEFAULT_TYPE, 
-    group_id: int, 
-    user_id: int
-) -> None:
-    """Ask for the next missing field"""
-    driver_data = DRIVER_DATA[group_id][user_id]
-
-    # Find first missing field
-    for field in FIELDS_ORDER:
-        if field not in driver_data or driver_data[field] is None:
-            await ask_field(update, context, group_id, user_id, field)
-            return
-
-    # All fields collected - show final template
-    await show_final_template(update, context, group_id, user_id)
-
-
-async def ask_field(
-    update: Update, 
-    context: ContextTypes.DEFAULT_TYPE, 
-    group_id: int, 
-    user_id: int, 
-    field: str
-) -> None:
-    """Ask for a specific field"""
-    context.user_data[f"awaiting_field_{group_id}_{user_id}"] = field
-
-    if field == "status":
-        # Show status options as buttons
-        keyboard = [
-            [InlineKeyboardButton(status, callback_data=f"status:{status}")]
-            for status in STATUS_OPTIONS
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        msg = await update.message.reply_text(FIELD_PROMPTS[field], reply_markup=reply_markup)
-    else:
-        msg = await update.message.reply_text(FIELD_PROMPTS[field])
-
-    context.user_data[f"last_message_{group_id}_{user_id}"] = msg.message_id
-
-
-async def handle_driver_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text input for driver information"""
-    message = update.message
-    group_id = message.chat.id
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    # Only process if this group has driver management enabled
-    if group_id not in ENABLED_GROUPS or not ENABLED_GROUPS[group_id]["enabled"]:
-        return
-
-    # Only process if awaiting input
-    is_awaiting_new_company = context.user_data.get(f"awaiting_new_company_{group_id}_{user_id}")
-    current_field = context.user_data.get(f"awaiting_field_{group_id}_{user_id}")
-
-    if not is_awaiting_new_company and not current_field:
-        # This is not driver information input, pass to dispatch handlers
-        return
-
-    # Check if awaiting new company name
-    if is_awaiting_new_company:
-        if group_id not in COMPANY_NAMES:
-            COMPANY_NAMES[group_id] = []
-        
-        if text not in COMPANY_NAMES[group_id]:
-            COMPANY_NAMES[group_id].append(text)
-
-        DRIVER_DATA[group_id][user_id]["company_name"] = text
-        context.user_data.pop(f"awaiting_new_company_{group_id}_{user_id}", None)
-
-        # Delete previous message and continue
-        try:
-            last_msg_id = context.user_data.pop(f"last_message_{group_id}_{user_id}", None)
-            if last_msg_id:
-                await context.bot.delete_message(group_id, last_msg_id)
-        except:
-            pass
-
-        await ask_for_missing_field(update, context, group_id, user_id)
-        return
-
-    # Handle field input
-    if current_field:
-        DRIVER_DATA[group_id][user_id][current_field] = text
-        context.user_data.pop(f"awaiting_field_{group_id}_{user_id}", None)
-
-        # Delete the question message
-        try:
-            last_msg_id = context.user_data.pop(f"last_message_{group_id}_{user_id}", None)
-            if last_msg_id:
-                await context.bot.delete_message(group_id, last_msg_id)
-        except:
-            pass
-
-        # Show current collected information
-        driver_data = DRIVER_DATA[group_id][user_id]
-        current_template = build_driver_template(driver_data)
-        await update.message.reply_text(
-            f"✅ Received!\n\n📋 Current collected information:\n\n{current_template}"
-        )
-
-        # Ask for next field
-        await ask_for_missing_field(update, context, group_id, user_id)
-
-
-async def handle_driver_status_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle status selection"""
-    query = update.callback_query
-    await query.answer()
-
-    group_id = query.message.chat.id
-    user_id = query.from_user.id
-    status = query.data.replace("status:", "")
-
-    DRIVER_DATA[group_id][user_id]["status"] = status
-    context.user_data.pop(f"awaiting_field_{group_id}_{user_id}", None)
-
-    await query.delete_message()
-
-    # Show current collected information
-    driver_data = DRIVER_DATA[group_id][user_id]
-    current_template = build_driver_template(driver_data)
-    await query.message.reply_text(
-        f"✅ Status saved!\n\n📋 Current collected information:\n\n{current_template}"
-    )
-
-    # Ask for next field or show final template
-    await ask_for_missing_field(update, context, group_id, user_id)
-
-
-async def show_final_template(
-    update: Update, 
-    context: ContextTypes.DEFAULT_TYPE, 
-    group_id: int, 
-    user_id: int
-) -> None:
-    """Show the completed driver information template"""
-    driver_data = DRIVER_DATA[group_id][user_id]
-    first_name = driver_data.get('first_name', '')
-    last_name = driver_data.get('last_name', '')
-
-    # Check if driver already exists
-    existing_driver = check_driver_exists(group_id, first_name, last_name)
-    
-    if existing_driver:
-        # Driver exists - ask to update
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✏️ Update Driver Info", callback_data=f"update_driver:{first_name}_{last_name}"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_driver"),
-            ]
-        ])
-        
-        existing_template = build_driver_template(existing_driver)
-        new_template = build_driver_template(driver_data)
-        
-        message_text = (
-            f"⚠️ DRIVER ALREADY EXISTS!\n\n"
-            f"🔴 Existing Driver:\n{existing_template}\n\n"
-            f"🟢 New Driver Info:\n{new_template}\n\n"
-            f"Would you like to update the driver information?"
-        )
-        
-        await update.message.reply_text(message_text, reply_markup=keyboard)
-        return
-    
-    # New driver - show final template
-    template = build_driver_template(driver_data)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm & Save", callback_data="confirm_driver")]
-    ])
-    
-    await update.message.reply_text(
-        f"📋 Complete Driver Information:\n\n{template}",
-        reply_markup=keyboard
-    )
-
-
-async def on_update_driver_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle update driver decision"""
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel_driver":
-        group_id = query.message.chat.id
-        user_id = query.from_user.id
-        
-        # Clear data
-        if user_id in DRIVER_DATA[group_id]:
-            DRIVER_DATA[group_id].pop(user_id, None)
-        
-        for key in list(context.user_data.keys()):
-            if f"{group_id}_{user_id}" in key:
-                context.user_data.pop(key, None)
-        
-        await query.edit_message_text("❌ Cancelled. Driver information not saved.")
-        return
-
-    if query.data == "confirm_driver":
-        group_id = query.message.chat.id
-        user_id = query.from_user.id
-        driver_data = DRIVER_DATA[group_id][user_id]
-        
-        # Save the driver
-        if group_id not in SAVED_DRIVERS:
-            SAVED_DRIVERS[group_id] = []
-        SAVED_DRIVERS[group_id].append(driver_data)
-        
-        # Clear data
-        DRIVER_DATA[group_id].pop(user_id, None)
-        for key in list(context.user_data.keys()):
-            if f"{group_id}_{user_id}" in key:
-                context.user_data.pop(key, None)
-        
-        template = build_driver_template(driver_data)
-        await query.edit_message_text(
-            f"✅ Driver Saved Successfully!\n\n{template}"
-        )
-        return
-
-    if query.data.startswith("update_driver:"):
-        group_id = query.message.chat.id
-        user_id = query.from_user.id
-        driver_data = DRIVER_DATA[group_id][user_id]
-        
-        # Update existing driver
-        first_name = driver_data.get('first_name', '')
-        last_name = driver_data.get('last_name', '')
-        
-        if group_id not in SAVED_DRIVERS:
-            SAVED_DRIVERS[group_id] = []
-        
-        # Find and update the driver
-        for i, driver in enumerate(SAVED_DRIVERS[group_id]):
-            if (driver.get('first_name', '') == first_name and 
-                driver.get('last_name', '') == last_name):
-                SAVED_DRIVERS[group_id][i] = driver_data
+def parse_driver_fields(text):
+    """Pulls out any recognizable 'Label: value' lines from free-form text."""
+    found = {}
+    for line in text.splitlines():
+        line = line.strip().lstrip("💁📰👨🚛📍").strip()
+        if ":" not in line and "#" not in line:
+            continue
+        for key, pattern in FIELD_PATTERNS.items():
+            m = re.match(rf"^{pattern}\s*[:#]?\s*(.+)$", line, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val:
+                    found[key] = val
                 break
-        
-        # Clear data
-        DRIVER_DATA[group_id].pop(user_id, None)
-        for key in list(context.user_data.keys()):
-            if f"{group_id}_{user_id}" in key:
-                context.user_data.pop(key, None)
-        
-        template = build_driver_template(driver_data)
-        await query.edit_message_text(
-            f"✅ Driver Updated Successfully!\n\n{template}"
+    return found
+
+
+def missing_fields(draft):
+    return [label for key, label in REQUIRED_FIELDS if not draft.get(key)]
+
+
+def build_template(draft):
+    status = draft.get("status") or "Pick up"
+    return (
+        f"💁 Driver Name: {draft.get('name','')}\n"
+        f"📰 Hired Company name: {draft.get('company','')}\n"
+        f"👨 Driver Type: {draft.get('driver_type','')}\n"
+        f"Ph-nu# {draft.get('phone','')}\n"
+        f"E-mail: {draft.get('email','')}\n"
+        f"License# {draft.get('license','')}\n"
+        f"🚛 Truck info:\n"
+        f"Unit#: {draft.get('unit','')}\n"
+        f"Year: {draft.get('year','')}\n"
+        f"Make: {draft.get('make','')}\n"
+        f"Made: {draft.get('made','')}\n"
+        f"VIN: {draft.get('vin','')}\n"
+        f"Plate: {draft.get('plate','')}\n\n"
+        f"📍Status: {status}"
+    )
+
+
+def _company_keyboard(data):
+    companies = data.get("companies", [])
+    rows = [[InlineKeyboardButton(c, callback_data=f"company_{i}")] for i, c in enumerate(companies)]
+    rows.append([InlineKeyboardButton("➕ Add new company", callback_data="company_add_new")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_updadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = storage.load()
+    data["update_group_id"] = update.effective_chat.id
+    data.setdefault("companies", [])
+    data["update_draft"] = {}
+    data["update_missing_msg_id"] = None
+    storage.save(data)
+    await update.message.reply_text("✅ This group is now the driver-update group.")
+
+
+async def _handle_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE, data, text):
+    """Called for any plain text sent in the registered update group."""
+    draft = data.get("update_draft", {})
+    draft.update(parse_driver_fields(text))
+    data["update_draft"] = draft
+    storage.save(data)
+
+    # clear the previous "still need..." prompt, if any — we just got new info
+    old_msg_id = data.get("update_missing_msg_id")
+    if old_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=old_msg_id)
+        except Exception:
+            pass
+        data["update_missing_msg_id"] = None
+
+    # company gets offered as buttons instead of typed, if we don't have it yet
+    if not draft.get("company"):
+        storage.save(data)
+        msg = await update.message.reply_text(
+            "🏢 Select the company, or add a new one:", reply_markup=_company_keyboard(data)
         )
+        data["update_missing_msg_id"] = msg.message_id
+        storage.save(data)
+        return
+
+    missing = missing_fields(draft)
+    if missing:
+        msg = await update.message.reply_text(
+            "Still need:\n" + "\n".join(f"• {m}" for m in missing)
+        )
+        data["update_missing_msg_id"] = msg.message_id
+        storage.save(data)
+        return
+
+    # complete! post the full template and reset for the next driver
+    await update.message.reply_text(build_template(draft))
+    data["update_draft"] = {}
+    data["update_missing_msg_id"] = None
+    storage.save(data)
+
+
+async def on_company_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = storage.load()
+    companies = data.get("companies", [])
+
+    if query.data == "company_add_new":
+        AWAITING_COMPANY.add(query.message.chat.id)
+        await query.edit_message_text("Type the new company name:")
+        await query.answer()
+        return
+
+    idx = int(query.data.split("_", 1)[1])
+    if 0 <= idx < len(companies):
+        draft = data.get("update_draft", {})
+        draft["company"] = companies[idx]
+        data["update_draft"] = draft
+        data["update_missing_msg_id"] = None
+        storage.save(data)
+        await query.edit_message_text(f"🏢 Company set: {companies[idx]}")
+
+        missing = missing_fields(draft)
+        if missing:
+            msg = await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text="Still need:\n" + "\n".join(f"• {m}" for m in missing),
+            )
+            data["update_missing_msg_id"] = msg.message_id
+            storage.save(data)
+        else:
+            await context.bot.send_message(chat_id=query.message.chat.id, text=build_template(draft))
+            data["update_draft"] = {}
+            storage.save(data)
+    await query.answer()
 
 
 # ===========================================================================
@@ -1081,33 +845,25 @@ def main():
 
     # maintenance / PTI
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("updadmin", cmd_updadmin))
     app.add_handler(CommandHandler("pti", cmd_pti))
     app.add_handler(CommandHandler("ptidone", cmd_ptidone))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("incident", cmd_incident))
     app.add_handler(CommandHandler("sms", cmd_sms))
 
-    # driver information management (Stage 4)
-    app.add_handler(CommandHandler("updadmin", updadmin_command))
-    app.add_handler(CommandHandler("newdriver", newdriver_command))
-
-    # shared callback handlers
+    # shared
     app.add_handler(CallbackQueryHandler(on_status_button, pattern="^status_"))
     app.add_handler(CallbackQueryHandler(on_pti_button, pattern="^(toggle_|pti_send)"))
     app.add_handler(CallbackQueryHandler(on_interval_button, pattern="^interval_"))
-    app.add_handler(CallbackQueryHandler(handle_company_selection, pattern="^company:"))
-    app.add_handler(CallbackQueryHandler(handle_driver_status_selection, pattern="^status:"))
-    app.add_handler(CallbackQueryHandler(on_update_driver_decision, pattern="^(update_driver:|confirm_driver|cancel_driver)"))
-
-    # message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_text_input))
+    app.add_handler(CallbackQueryHandler(on_company_button, pattern="^company_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, cache_media))
 
     app.job_queue.run_repeating(reminder_job, interval=60, first=60)
     app.job_queue.run_daily(daily_report_job, time=dtime(hour=DAILY_REPORT_HOUR_UTC))
 
-    log.info("Combined DEAC bot (Stage 3 + 4) starting…")
+    log.info("Combined DEAC bot (Stage 3) starting…")
     start_keep_alive()
     app.run_polling()
 
