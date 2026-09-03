@@ -35,6 +35,7 @@ _DEFAULT = {
     "update_draft": {},
     "update_missing_msg_id": None,
     "companies": [],
+    "driver_profiles": {},  # lowercase name -> {fields..., "ts": iso}
 }
 
 # driver record:
