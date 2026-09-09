@@ -810,37 +810,59 @@ def _split_line_multi(line):
     return segments
 
 
+# when a line has no label and doesn't look like an email/VIN/phone, these
+# are the fields it could still be — assigned in this order, matching the
+# order Sarvarbek normally sends them: Name, (email/VIN/phone auto-detected
+# by shape), Make, Made/Model, Plate, License
+POSITIONAL_FALLBACK_ORDER = ["name", "make", "made", "plate", "license"]
+
+
 def parse_driver_fields(text):
     """Pulls recognizable fields out of free-form text:
     - labeled lines, including several labels on one line
-    - unlabeled values it can still recognize by shape (email, VIN, phone)
+    - unlabeled lines recognized by shape (email, VIN, phone)
+    - remaining unlabeled lines, assigned positionally in
+      POSITIONAL_FALLBACK_ORDER for whichever of those fields are still
+      missing (name, make, made, plate, license)
     """
     found = {}
+    unclaimed_lines = []
+
     for raw_line in text.splitlines():
         line = raw_line.strip().lstrip("💁📰👨🚛📍").strip()
         if not line:
             continue
-        for label_text, val in _split_line_multi(line):
-            if not val:
-                continue
-            for key, pat in FIELD_PATTERNS.items():
-                if re.fullmatch(pat, label_text.strip(), re.IGNORECASE):
-                    found[key] = val
-                    break
 
-    # context-based fallback for values sent without any label at all
-    if "email" not in found:
-        m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
-        if m:
-            found["email"] = m.group(0)
-    if "vin" not in found:
-        m = re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text.upper())
-        if m:
-            found["vin"] = m.group(0)
-    if "phone" not in found:
-        m = re.search(r"(\+?\d[\d\-\s\(\)]{8,}\d)", text)
-        if m:
-            found["phone"] = m.group(0).strip()
+        segments = _split_line_multi(line)
+        if segments:
+            for label_text, val in segments:
+                if not val:
+                    continue
+                for key, pat in FIELD_PATTERNS.items():
+                    if re.fullmatch(pat, label_text.strip(), re.IGNORECASE):
+                        found[key] = val
+                        break
+            continue
+
+        if re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.-]+", line):
+            found.setdefault("email", line)
+            continue
+        if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", line.upper()):
+            found.setdefault("vin", line.upper())
+            continue
+        if re.fullmatch(r"\+?\d[\d\-\s\(\)]{8,}\d", line):
+            found.setdefault("phone", line)
+            continue
+
+        unclaimed_lines.append(line)
+
+    idx = 0
+    for key in POSITIONAL_FALLBACK_ORDER:
+        if key in found:
+            continue
+        if idx < len(unclaimed_lines):
+            found[key] = unclaimed_lines[idx]
+            idx += 1
 
     return found
 
